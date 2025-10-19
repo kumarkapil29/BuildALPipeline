@@ -1,0 +1,88 @@
+# .github/workflows/build-pipeline.yml
+#
+# This YAML file defines a GitHub Actions workflow to build a
+# Dynamics 365 Business Central extension using the dotnet AL compiler tool.
+
+name: Build Business Central App
+
+# Trigger: This workflow runs on every push to any branch.
+on:
+  push:
+    branches: [ '**' ]
+
+jobs:
+  build:
+    # Use a Windows runner because the AL compiler is a .exe
+    runs-on: windows-latest
+
+    steps:
+    # Step 1: Check out the repository's source code
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Step 2: Set up the .NET SDK (required to run dotnet tools)
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.x' # Use a version compatible with the AL tools
+
+    # Step 3: Install the AL development tools package globally on the runner
+    - name: Install AL Compiler Tools
+      run: dotnet tool install Microsoft.Dynamics.businesscentral.development.tools --global --prerelease
+
+    # Step 4: Restore dependencies from GitHub Packages
+    # This step uses the NUGET_PAT secret to authenticate.
+    # It reads the nuget.config file and downloads the BC-Symbols package.
+    - name: Restore AL Dependencies
+      run: |
+        dotnet new nugetconfig
+        dotnet nuget add source --name "github" --username "kumarkapil29" --password "${{ secrets.NUGET_PAT }}" --store-password-in-clear-text "https://nuget.pkg.github.com/kumarkapil29/index.json"
+        dotnet add package BC-Symbols --version 27.0.0.0 # Match your symbol package version
+      env:
+        NUGET_PAT: ${{ secrets.NUGET_PAT }}
+      shell: pwsh
+
+    # Step 5: Construct the app version number
+    # It reads app.json, combines it with the GitHub run number, and sets it as an output variable.
+    - name: Set App Version
+      id: set_version
+      run: |
+        $appJson = Get-Content -Path "app.json" | ConvertFrom-Json
+        $version = "$($appJson.version.split('.')[0]).$($appJson.version.split('.')[1]).${{ github.run_number }}.$($appJson.version.split('.')[3])"
+        echo "appVersion=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        echo "App will be built with version: $version"
+      shell: pwsh
+
+    # Step 6: Compile the AL Project
+    # This calls the AL compiler directly with all necessary parameters.
+    - name: Compile AL App
+      run: |
+        # Find the path to the restored symbols package
+        $packageCachePath = (Get-ChildItem -Path "$($env:USERPROFILE)\.nuget\packages\bc-symbols" -Recurse | Where-Object { $_.Name -eq 'lib' } | Select-Object -First 1).FullName
+        if (-not $packageCachePath) {
+          throw "Could not find the symbols package cache path."
+        }
+        echo "Symbols located at: $packageCachePath"
+
+        # Run the compiler
+        alc.exe /project:"." /packagecachepath:"$packageCachePath" /out:"WebApp.app" /version:"${{ steps.set_version.outputs.appVersion }}"
+      shell: pwsh
+
+    # Step 7: Upload the compiled .app file as a build artifact
+    # This makes the output available for download or for use in a later deployment job.
+    - name: Upload App Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AppFile
+        path: WebApp.app # The output name from the compile step
+
+    # Step 8 (Optional): Create and upload a symbols-only .app file
+    - name: Create and Upload Symbols Artifact
+      run: |
+        alc.exe /project:"." /packagecachepath:"$((Get-ChildItem -Path "$($env:USERPROFILE)\.nuget\packages\bc-symbols" -Recurse | Where-Object { $_.Name -eq 'lib' } | Select-Object -First 1).FullName)" /out:"WebApp_Symbols.app" /version:"${{ steps.set_version.outputs.appVersion }}" /createsymbolpackage
+      shell: pwsh
+    - name: Upload Symbols Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SymbolsFile
+        path: WebApp_Symbols.app
